@@ -2,28 +2,22 @@ package com.webcrawler;
 
 import java.io.IOException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /** Downloads each site's robots.txt once and shares it between all threads crawling that site. */
 final class RobotsCache {
 
-    private final HttpClient client;
+    private static final int MAX_REDIRECTS = 5;
+
+    private final PageFetcher fetcher;
     private final String userAgent;
-    private final Duration timeout;
     private final ConcurrentHashMap<String, CompletableFuture<RobotsTxt>> byOrigin = new ConcurrentHashMap<>();
 
-    RobotsCache(String userAgent, Duration timeout) {
+    RobotsCache(PageFetcher fetcher, String userAgent) {
+        this.fetcher = fetcher;
         this.userAgent = userAgent;
-        this.timeout = timeout;
-        this.client = HttpClient.newBuilder()
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .connectTimeout(timeout)
-                .build();
     }
 
     RobotsTxt forUrl(URI url) {
@@ -44,21 +38,27 @@ final class RobotsCache {
     }
 
     private RobotsTxt download(String origin) {
-        HttpRequest request = HttpRequest.newBuilder(URI.create(origin + "/robots.txt"))
-                .timeout(timeout)
-                .header("User-Agent", userAgent)
-                .GET()
-                .build();
+        URI url = URI.create(origin + "/robots.txt");
         try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            int status = response.statusCode();
-            if (status >= 200 && status < 300) {
-                return RobotsTxt.parse(response.body(), userAgent);
+            // Redirects are followed by hand so every hop goes through the NetworkGuard.
+            for (int hop = 0; hop <= MAX_REDIRECTS; hop++) {
+                PageFetcher.Response response = fetcher.fetchRobots(url);
+                if (response.redirectTo() != null) {
+                    url = response.redirectTo();
+                    continue;
+                }
+                int status = response.status();
+                if (status >= 200 && status < 300 && response.hasBody()) {
+                    return RobotsTxt.parse(new String(response.body(), StandardCharsets.UTF_8), userAgent);
+                }
+                if (status < 500) {
+                    return RobotsTxt.ALLOW_ALL; // no robots.txt: everything is allowed
+                }
+                return RobotsTxt.DISALLOW_ALL; // server error: RFC 9309 says to assume the whole site is off limits
             }
-            if (status >= 400 && status < 500) {
-                return RobotsTxt.ALLOW_ALL; // no robots.txt: everything is allowed
-            }
-            return RobotsTxt.DISALLOW_ALL; // server error: RFC 9309 says to assume the whole site is off limits
+            return RobotsTxt.ALLOW_ALL; // too many redirects: RFC 9309 treats it as missing
+        } catch (NetworkGuard.UnsafeAddressException e) {
+            return RobotsTxt.DISALLOW_ALL; // robots.txt points into a private network: stay away from the site
         } catch (IOException e) {
             // The page fetch will fail too and record the real network error.
             return RobotsTxt.ALLOW_ALL;
